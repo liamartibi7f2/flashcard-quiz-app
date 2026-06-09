@@ -776,3 +776,167 @@ a:hover { color: var(--accent-hover); }
 #site-footer strong {
   color: var(--accent);
 }
+
+/* ===== AI Generate Modal ===== */
+.ai-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.ai-card {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  transition: border-color var(--transition);
+}
+
+.ai-card:hover {
+  border-color: var(--accent);
+}
+
+.ai-card-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.ai-step-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+  font-size: 0.9rem;
+  flex-shrink: 0;
+}
+
+.ai-upload-area {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: 32px 20px;
+  text-align: center;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.ai-upload-area:hover,
+.ai-upload-area.dragover {
+  border-color: var(--accent);
+  background: var(--accent-light);
+}
+
+.ai-upload-icon {
+  font-size: 2.5rem;
+  margin-bottom: 8px;
+}
+
+.ai-upload-area .file-ready {
+  color: var(--success);
+  font-weight: 500;
+}
+
+/* Loading spinner */
+.ai-loading-card {
+  text-align: center;
+  padding: 30px;
+  background: var(--accent-light);
+  border-color: var(--accent);
+}
+
+.ai-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: ai-spin 0.8s linear infinite;
+  margin: 0 auto 12px;
+}
+
+@keyframes ai-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Error card */
+.ai-error-card {
+  background: var(--danger-bg);
+  border-color: var(--danger);
+  color: var(--danger);
+  text-align: center;
+  padding: 16px;
+}
+
+/* Results card */
+.ai-results-card {
+  background: var(--success-bg);
+  border-color: var(--success);
+}
+
+.ai-results-header {
+  text-align: center;
+  margin-bottom: 16px;
+}
+
+.ai-results-header .big-count {
+  font-size: 2.5rem;
+  font-weight: 800;
+  color: var(--success);
+}
+
+.ai-results-header p {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+.ai-card-preview {
+  max-height: 250px;
+  overflow-y: auto;
+  margin-bottom: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.ai-preview-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ai-preview-item:last-child {
+  border-bottom: none;
+}
+
+.ai-preview-front {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.ai-preview-back {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+}
+
+.ai-results-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+
+/* Responsive for AI modal */
+@media (max-width: 640px) {
+  .ai-upload-area {
+    padding: 24px 16px;
+  }
+  .ai-card {
+    padding: 16px;
+  }
+}

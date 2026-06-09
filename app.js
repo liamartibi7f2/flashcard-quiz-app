@@ -90,7 +90,9 @@ const Store = {
       settings: {
         theme: 'light',
         newCardsPerDay: 20,
-        reviewsPerDay: 100
+        reviewsPerDay: 100,
+        geminiApiKey: '',
+        nvidiaApiKey: ''
       }
     };
     this.save(defaultState);
@@ -351,7 +353,236 @@ const SM2 = {
   }
 };
 
-// ===== 5. STATE MANAGEMENT =====
+// ===== 5. AI UTILITIES =====
+
+/** Process uploaded files (TXT, PDF, DOCX) and extract text */
+const FileProcessor = {
+  async extractText(file) {
+    const ext = file.name.split('.').pop().toLowerCase();
+    if (ext === 'txt') {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => resolve(e.target.result);
+        reader.onerror = () => reject(new Error('Failed to read TXT file'));
+        reader.readAsText(file);
+      });
+    }
+    if (ext === 'pdf') {
+      return this._extractPDF(file);
+    }
+    if (ext === 'docx') {
+      return this._extractDOCX(file);
+    }
+    throw new Error('Unsupported file type: .' + ext + '. Please upload a TXT, PDF, or DOCX file.');
+  },
+
+  async _extractPDF(file) {
+    await this._loadPDFJS();
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    let fullText = '';
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const pageText = content.items.map(item => item.str).join(' ');
+      fullText += pageText + '\n';
+    }
+    return fullText.trim();
+  },
+
+  async _extractDOCX(file) {
+    await this._loadMammoth();
+    const arrayBuffer = await file.arrayBuffer();
+    const result = await mammoth.extractRawText({ arrayBuffer });
+    return result.value.trim();
+  },
+
+  _loadPDFJS() {
+    if (window.pdfjsLib) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+      script.onload = () => {
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        resolve();
+      };
+      script.onerror = () => reject(new Error('Failed to load PDF parser'));
+      document.head.appendChild(script);
+    });
+  },
+
+  _loadMammoth() {
+    if (window.mammoth) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.8.0/mammoth.browser.min.js';
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error('Failed to load DOCX parser'));
+      document.head.appendChild(script);
+    });
+  }
+};
+
+/** Generate flashcards using Gemini API (with Nvidia fallback) */
+const AIGenerator = {
+  GEMINI_URL: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
+
+  NVIDIA_URL: 'https://integrate.api.nvidia.com/v1/chat/completions',
+
+  async generate(fileText, userDescription, geminiKey, nvidiaKey) {
+    const prompt = this._buildPrompt(fileText, userDescription);
+
+    // Try Gemini first
+    if (geminiKey) {
+      try {
+        return await this._callGemini(prompt, geminiKey);
+      } catch (e) {
+        console.warn('Gemini failed:', e.message);
+        // Try Nvidia fallback
+        if (nvidiaKey) {
+          return await this._callNvidia(prompt, nvidiaKey);
+        }
+        throw new Error('Gemini API failed and no Nvidia fallback key configured: ' + e.message);
+      }
+    }
+
+    // No Gemini key, try Nvidia directly
+    if (nvidiaKey) {
+      return await this._callNvidia(prompt, nvidiaKey);
+    }
+
+    throw new Error('No API key configured. Please add a Gemini or Nvidia API key in Settings.');
+  },
+
+  _buildPrompt(fileText, userDescription) {
+    // Truncate very long texts to avoid token limits
+    const maxChars = 30000;
+    const truncated = fileText.length > maxChars
+      ? fileText.substring(0, maxChars) + '\n[...content truncated due to length...]'
+      : fileText;
+
+    return `You are a professional flashcard creator for students. Your task is to create high-quality study flashcards from the provided content.
+
+IMPORTANT RULES:
+- Create 10-20 flashcards covering the most important concepts, terms, and facts
+- Each flashcard MUST have a clear question on the front and a concise answer on the back
+- Questions should test understanding, not just memorization
+- Keep answers clear and to the point (2-5 sentences max)
+- If the content is in Vietnamese, write the flashcards in Vietnamese
+- If content is in English, write in English
+
+USER'S INSTRUCTIONS: ${userDescription || 'Extract the key concepts and create comprehensive study flashcards.'}
+
+SOURCE CONTENT:
+${truncated}
+
+Return ONLY a valid JSON object (no markdown, no code fences, no extra text) in this EXACT format:
+{
+  "deckName": "A descriptive name for this deck (max 60 chars)",
+  "deckDescription": "Brief description of what this deck covers (max 120 chars)",
+  "cards": [
+    {"front": "Question or term?", "back": "Answer or definition."}
+  ]
+}`;
+  },
+
+  async _callGemini(prompt, apiKey) {
+    const response = await fetch(`${this.GEMINI_URL}?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.7, maxOutputTokens: 4096 }
+      })
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      const msg = err.error?.message || `HTTP ${response.status}`;
+      if (response.status === 429 || response.status === 503) {
+        throw new Error('Gemini is overloaded. Try again or use Nvidia fallback.');
+      }
+      throw new Error('Gemini API error: ' + msg);
+    }
+
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) throw new Error('Empty response from Gemini');
+    return this._parseResponse(text);
+  },
+
+  async _callNvidia(prompt, apiKey) {
+    const response = await fetch(this.NVIDIA_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: 'meta/llama-3.3-70b-instruct',
+        messages: [
+          { role: 'system', content: 'You are a flashcard generator. Always respond with valid JSON only, no markdown.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.7,
+        max_tokens: 4096
+      })
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error('Nvidia API error: ' + (err.message || `HTTP ${response.status}`));
+    }
+
+    const data = await response.json();
+    const text = data.choices?.[0]?.message?.content;
+    if (!text) throw new Error('Empty response from Nvidia');
+    return this._parseResponse(text);
+  },
+
+  _parseResponse(text) {
+    // Clean up the response - remove markdown code fences if present
+    let cleaned = text.trim();
+    // Remove markdown code fences
+    cleaned = cleaned.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?\s*```$/i, '');
+    // Find JSON object boundaries
+    const start = cleaned.indexOf('{');
+    const end = cleaned.lastIndexOf('}');
+    if (start === -1 || end === -1) {
+      throw new Error('AI response did not contain valid JSON. Please try again.');
+    }
+    cleaned = cleaned.substring(start, end + 1);
+
+    let data;
+    try {
+      data = JSON.parse(cleaned);
+    } catch (e) {
+      throw new Error('Failed to parse AI response. The AI may have returned malformed data. Please try again.');
+    }
+
+    // Validate the response structure
+    if (!data.deckName || typeof data.deckName !== 'string') {
+      throw new Error('AI did not generate a valid deck name. Please try again.');
+    }
+    if (!Array.isArray(data.cards) || data.cards.length === 0) {
+      throw new Error('AI did not generate any flashcards. Please try with more detailed content.');
+    }
+
+    // Validate each card
+    const validCards = data.cards.filter(c => c.front && c.back && typeof c.front === 'string' && typeof c.back === 'string');
+    if (validCards.length === 0) {
+      throw new Error('AI generated cards with invalid format. Please try again.');
+    }
+
+    return {
+      deckName: data.deckName.substring(0, 60),
+      deckDescription: (data.deckDescription || '').substring(0, 120),
+      cards: validCards
+    };
+  }
+};
+
+// ===== 6. STATE MANAGEMENT =====
 const State = {
   _data: null,
 
@@ -631,7 +862,9 @@ const State = {
       settings: {
         theme: 'light',
         newCardsPerDay: 20,
-        reviewsPerDay: 100
+        reviewsPerDay: 100,
+        geminiApiKey: '',
+        nvidiaApiKey: ''
       }
     };
     this._persist();
@@ -639,7 +872,7 @@ const State = {
   }
 };
 
-// ===== 6. VIEWS — Render functions =====
+// ===== 7. VIEWS — Render functions =====
 
 const Views = {
   _escape(str) {
@@ -676,7 +909,10 @@ const Views = {
           <div class="empty-icon">📚</div>
           <h2>No decks yet</h2>
           <p>Create your first flashcard deck to get started.</p>
-          <button class="btn btn-primary" data-action="create-deck">+ Create Your First Deck</button>
+          <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
+            <button class="btn btn-primary" data-action="create-deck">+ Create Your First Deck</button>
+            <button class="btn btn-success" data-action="ai-generate">🤖 Generate from File</button>
+          </div>
         </div>
       `;
     }
@@ -687,7 +923,10 @@ const Views = {
           <h1>My Decks</h1>
           <p>${this._getTotalDueText(state)}</p>
         </div>
-        <button class="btn btn-primary" data-action="create-deck">+ New Deck</button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn btn-primary" data-action="create-deck">+ New Deck</button>
+          <button class="btn btn-success" data-action="ai-generate">🤖 Generating file</button>
+        </div>
       </div>
       <div class="deck-grid">
     `;
@@ -1108,6 +1347,38 @@ const Views = {
         </div>
       </div>
 
+      <div class="settings-section">
+        <h3>🤖 AI Flashcard Generation</h3>
+        <p style="font-size:0.82rem;color:var(--text-secondary);margin-bottom:12px;">
+          Enter your API keys to enable AI-powered flashcard generation from uploaded files.
+          <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener" style="color:var(--accent);">Get a free Gemini API key →</a>
+        </p>
+        <div class="setting-row">
+          <div class="setting-label">
+            <strong>Gemini API Key</strong>
+            <span>Your Google Gemini API key (stored locally in your browser only)</span>
+          </div>
+          <div class="setting-control">
+            <input type="password" class="form-input" style="width:220px;"
+                   id="setting-gemini-key" value="${s.geminiApiKey || ''}"
+                   placeholder="AIza...">
+            <button class="btn btn-sm btn-secondary" data-action="save-gemini-key" style="margin-top:6px;">💾 Save</button>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">
+            <strong>Nvidia API Key (Fallback)</strong>
+            <span>Optional. Used if Gemini is overloaded. Your key stays in your browser.</span>
+          </div>
+          <div class="setting-control">
+            <input type="password" class="form-input" style="width:220px;"
+                   id="setting-nvidia-key" value="${s.nvidiaApiKey || ''}"
+                   placeholder="nvapi-...">
+            <button class="btn btn-sm btn-secondary" data-action="save-nvidia-key" style="margin-top:6px;">💾 Save</button>
+          </div>
+        </div>
+      </div>
+
       <div class="settings-section" style="border:2px solid var(--accent);background:var(--accent-light);">
         <h3>💾 Data Management — Move Your Progress</h3>
         <p style="font-size:0.85rem;color:var(--text-secondary);margin-bottom:16px;">
@@ -1157,10 +1428,90 @@ const Views = {
         Flashcard Quiz App v${APP_VERSION} · Data stored in browser localStorage
       </div>
     `;
+  },
+
+  /** Render the AI generation modal content */
+  renderAIGenerateModal(state) {
+    const hasGemini = !!(state.settings.geminiApiKey);
+    const hasNvidia = !!(state.settings.nvidiaApiKey);
+    const hasAnyKey = hasGemini || hasNvidia;
+    const statusCls = hasAnyKey ? 'status-ready' : 'status-missing';
+
+    return `
+      <div class="ai-modal">
+        <!-- Step 1: File Upload -->
+        <div class="ai-card">
+          <div class="ai-card-header">
+            <span class="ai-step-badge">1</span>
+            <div>
+              <strong>Upload Your File</strong>
+              <span style="font-size:0.8rem;color:var(--text-secondary);display:block;">TXT, PDF, or DOCX</span>
+            </div>
+          </div>
+          <div class="ai-upload-area" id="ai-drop-zone">
+            <div class="ai-upload-icon">📄</div>
+            <p style="font-weight:600;margin-bottom:4px;">Drag & drop your file here</p>
+            <p style="font-size:0.82rem;color:var(--text-secondary);">or click to browse · Max 10MB</p>
+            <input type="file" id="ai-file-input" accept=".txt,.pdf,.docx" style="display:none;">
+            <div id="ai-file-info" style="display:none;margin-top:12px;"></div>
+          </div>
+        </div>
+
+        <!-- Step 2: Instructions -->
+        <div class="ai-card">
+          <div class="ai-card-header">
+            <span class="ai-step-badge">2</span>
+            <div>
+              <strong>Describe What You Want</strong>
+              <span style="font-size:0.8rem;color:var(--text-secondary);display:block;">Tell the AI what kind of flashcards to create</span>
+            </div>
+          </div>
+          <textarea class="form-textarea" id="ai-description" rows="3"
+            placeholder="e.g. 'Create flashcards covering the key terms and definitions from this chapter' or 'Generate Q&amp;A pairs about the main arguments in this article'"></textarea>
+        </div>
+
+        <!-- Step 3: Generate -->
+        <div class="ai-card">
+          <div class="ai-card-header">
+            <span class="ai-step-badge">3</span>
+            <div>
+              <strong>Generate Flashcards</strong>
+              <span style="font-size:0.8rem;color:var(--text-secondary);display:block;">
+                ${hasAnyKey
+                  ? '✅ API key configured — ready to generate!'
+                  : '⚠️ No API key found. <a href="#settings" style="color:var(--accent);">Add one in Settings →</a>'}
+              </span>
+            </div>
+          </div>
+          <div style="text-align:center;">
+            <button class="btn btn-success btn-lg" data-action="ai-generate-start"
+              ${!hasAnyKey ? 'disabled' : ''}>
+              🪄 Generate Flashcards
+            </button>
+            <p style="font-size:0.75rem;color:var(--text-muted);margin-top:8px;">
+              ${hasGemini ? 'Using Google Gemini' : hasNvidia ? 'Using Nvidia AI' : 'No API key — add one in Settings'}
+            </p>
+          </div>
+        </div>
+
+        <!-- Loading state -->
+        <div id="ai-loading" style="display:none;" class="ai-card ai-loading-card">
+          <div class="ai-spinner"></div>
+          <p>Generating your flashcards...</p>
+          <p style="font-size:0.8rem;color:var(--text-muted);">This may take 10–30 seconds</p>
+        </div>
+
+        <!-- Error state -->
+        <div id="ai-error" style="display:none;" class="ai-card ai-error-card"></div>
+
+        <!-- Results preview -->
+        <div id="ai-results" style="display:none;" class="ai-card ai-results-card"></div>
+      </div>
+    `;
   }
 };
 
-// ===== 7. ROUTER AND EVENT HANDLERS =====
+// ===== 8. ROUTER AND EVENT HANDLERS =====
 
 const Router = {
   init() {
@@ -1309,6 +1660,16 @@ const Router = {
         case 'reset-all': this._confirmResetAll(); break;
         case 'toggle-theme': this._toggleTheme(); break;
         case 'toggle-theme-setting': this._toggleThemeFromSetting(btn); break;
+
+        // AI Generation
+        case 'ai-generate': this._showAIGenerateModal(); break;
+        case 'ai-generate-start': this._startAIGeneration(); break;
+        case 'ai-import-deck': this._importAIDeck(); break;
+        case 'ai-regenerate': this._startAIGeneration(); break;
+
+        // Settings
+        case 'save-gemini-key': this._saveApiKey('geminiApiKey', 'setting-gemini-key'); break;
+        case 'save-nvidia-key': this._saveApiKey('nvidiaApiKey', 'setting-nvidia-key'); break;
 
         // Modal
         case 'modal-close': this._closeModal(); break;
@@ -1744,10 +2105,231 @@ const Router = {
         </div>
       </div>
     `);
+  },
+
+  // ---- AI Generation ----
+
+  _showAIGenerateModal() {
+    const state = State.getState();
+    const hasAnyKey = !!(state.settings.geminiApiKey || state.settings.nvidiaApiKey);
+
+    if (!hasAnyKey) {
+      this._openModal('🤖 AI Flashcard Generation', `
+        <div style="text-align:center;padding:20px 0;">
+          <div style="font-size:3rem;margin-bottom:12px;">🔑</div>
+          <h3 style="margin-bottom:8px;">API Key Required</h3>
+          <p style="color:var(--text-secondary);margin-bottom:16px;">
+            To use AI flashcard generation, you need to add a Gemini or Nvidia API key in Settings first.
+          </p>
+          <div style="display:flex;gap:8px;justify-content:center;">
+            <button class="btn btn-secondary" data-action="modal-close">Cancel</button>
+            <a href="#settings" class="btn btn-primary" data-action="modal-close">Go to Settings →</a>
+          </div>
+        </div>
+      `);
+      return;
+    }
+
+    this._openModal('🤖 Generate Flashcards from File', Views.renderAIGenerateModal(state));
+    this._currentGenFile = null;
+    this._currentGenText = null;
+
+    // Set up drag-and-drop for the upload area
+    setTimeout(() => {
+      const dropZone = document.getElementById('ai-drop-zone');
+      const fileInput = document.getElementById('ai-file-input');
+      if (!dropZone || !fileInput) return;
+
+      dropZone.addEventListener('click', () => fileInput.click());
+
+      dropZone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        dropZone.classList.add('dragover');
+      });
+
+      dropZone.addEventListener('dragleave', () => {
+        dropZone.classList.remove('dragover');
+      });
+
+      dropZone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropZone.classList.remove('dragover');
+        const file = e.dataTransfer.files[0];
+        if (file) this._handleAIFile(file);
+      });
+
+      fileInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (file) this._handleAIFile(file);
+      });
+    }, 150);
+  },
+
+  async _handleAIFile(file) {
+    const validTypes = ['txt', 'pdf', 'docx'];
+    const ext = file.name.split('.').pop().toLowerCase();
+
+    if (!validTypes.includes(ext)) {
+      this._showToast('❌ Unsupported file type. Please upload TXT, PDF, or DOCX.');
+      return;
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
+      this._showToast('❌ File too large. Maximum size is 10MB.');
+      return;
+    }
+
+    const fileInfo = document.getElementById('ai-file-info');
+    const uploadArea = document.getElementById('ai-drop-zone');
+
+    // Update upload area UI
+    if (fileInfo) {
+      fileInfo.style.display = 'block';
+      fileInfo.innerHTML = `
+        <div class="file-ready">
+          ✅ <strong>${Views._escape(file.name)}</strong>
+          <span style="color:var(--text-secondary);font-weight:400;">
+            (${(file.size / 1024).toFixed(1)} KB)
+          </span>
+        </div>
+      `;
+    }
+    if (uploadArea) {
+      uploadArea.style.borderColor = 'var(--success)';
+      uploadArea.querySelector('.ai-upload-icon').textContent = '📑';
+    }
+
+    // Extract text
+    try {
+      if (fileInfo) {
+        fileInfo.innerHTML += '<p style="color:var(--text-secondary);font-size:0.8rem;">⏳ Extracting text...</p>';
+      }
+      this._currentGenText = await FileProcessor.extractText(file);
+      this._currentGenFile = file;
+
+      if (fileInfo) {
+        fileInfo.innerHTML = `
+          <div class="file-ready">
+            ✅ <strong>${Views._escape(file.name)}</strong>
+            <span style="color:var(--text-secondary);font-weight:400;">
+              (${(file.size / 1024).toFixed(1)} KB) · ${this._currentGenText.length.toLocaleString()} chars extracted
+            </span>
+          </div>
+          <p style="color:var(--success);font-size:0.8rem;margin-top:4px;">✅ Text extracted successfully!</p>
+        `;
+      }
+    } catch (err) {
+      if (fileInfo) {
+        fileInfo.innerHTML = `
+          <p style="color:var(--danger);font-size:0.85rem;">❌ ${Views._escape(err.message)}</p>
+        `;
+      }
+      this._showToast('❌ ' + err.message);
+    }
+  },
+
+  async _startAIGeneration() {
+    if (!this._currentGenText) {
+      this._showToast('⚠️ Please upload a file first.');
+      return;
+    }
+
+    const description = document.getElementById('ai-description')?.value?.trim() || '';
+    const state = State.getState();
+    const geminiKey = state.settings.geminiApiKey || '';
+    const nvidiaKey = state.settings.nvidiaApiKey || '';
+
+    // Show loading, hide other states
+    const loadingEl = document.getElementById('ai-loading');
+    const errorEl = document.getElementById('ai-error');
+    const resultsEl = document.getElementById('ai-results');
+    if (loadingEl) loadingEl.style.display = 'block';
+    if (errorEl) errorEl.style.display = 'none';
+    if (resultsEl) resultsEl.style.display = 'none';
+
+    try {
+      const result = await AIGenerator.generate(this._currentGenText, description, geminiKey, nvidiaKey);
+
+      // Hide loading
+      if (loadingEl) loadingEl.style.display = 'none';
+
+      // Store result for later import
+      this._pendingAIDeck = result;
+
+      // Show results
+      if (resultsEl) {
+        resultsEl.style.display = 'block';
+        const previewCards = result.cards.slice(0, 10);
+        const remaining = result.cards.length - 10;
+        resultsEl.innerHTML = `
+          <div class="ai-results-header">
+            <div class="big-count">${result.cards.length}</div>
+            <p>flashcards generated</p>
+          </div>
+          <div style="text-align:center;margin-bottom:12px;">
+            <strong>${Views._escape(result.deckName)}</strong>
+            <p style="font-size:0.82rem;color:var(--text-secondary);">${Views._escape(result.deckDescription)}</p>
+          </div>
+          <div class="ai-card-preview">
+            ${previewCards.map(c => `
+              <div class="ai-preview-item">
+                <div class="ai-preview-front">${Views._escape(c.front)}</div>
+                <div class="ai-preview-back">${Views._escape(c.back)}</div>
+              </div>
+            `).join('')}
+            ${remaining > 0 ? `<div class="ai-preview-item" style="text-align:center;color:var(--text-muted);font-style:italic;">... and ${remaining} more</div>` : ''}
+          </div>
+          <div class="ai-results-actions">
+            <button class="btn btn-success" data-action="ai-import-deck">✅ Import to My Decks</button>
+            <button class="btn btn-secondary" data-action="ai-regenerate">🔄 Regenerate</button>
+          </div>
+        `;
+      }
+
+      // Scroll to results
+      if (resultsEl) resultsEl.scrollIntoView({ behavior: 'smooth' });
+    } catch (err) {
+      if (loadingEl) loadingEl.style.display = 'none';
+      console.error('AI generation error:', err);
+      if (errorEl) {
+        errorEl.style.display = 'block';
+        errorEl.innerHTML = `<p><strong>⚠️ Generation failed</strong></p><p style="font-size:0.85rem;">${Views._escape(err.message)}</p>`;
+      }
+    }
+  },
+
+  _importAIDeck() {
+    if (!this._pendingAIDeck) {
+      this._showToast('Nothing to import. Please generate first.');
+      return;
+    }
+
+    const { deckName, deckDescription, cards } = this._pendingAIDeck;
+    const deck = State.addDeck(deckName, deckDescription);
+
+    for (const card of cards) {
+      State.addCard(deck.id, card.front, card.back);
+    }
+
+    this._closeModal();
+    this._showToast(`✅ Imported "${deckName}" with ${cards.length} cards!`);
+    this._pendingAIDeck = null;
+    this._currentGenFile = null;
+    this._currentGenText = null;
+    location.hash = 'deck?id=' + deck.id;
+  },
+
+  _saveApiKey(settingKey, inputId) {
+    const input = document.getElementById(inputId);
+    if (!input) return;
+    const value = input.value.trim();
+    State.updateSettings({ [settingKey]: value });
+    this._showToast('✅ API key saved! (stored in your browser only)');
+    this.navigate();
   }
 };
 
-// ===== 8. INITIALIZATION =====
+// ===== 9. INITIALIZATION =====
 document.addEventListener('DOMContentLoaded', () => {
   // Initialize state
   State.init();
