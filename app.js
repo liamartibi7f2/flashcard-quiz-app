@@ -423,11 +423,14 @@ const FileProcessor = {
   }
 };
 
-/** Generate flashcards using Gemini API (with Nvidia fallback) */
+/** Generate flashcards using Gemini API (with Nvidia fallback via CORS proxy) */
 const AIGenerator = {
+  // Gemini supports CORS from browsers when using API key in query string
   GEMINI_URL: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
 
+  // Nvidia NIM does NOT support CORS from browsers — we use a public CORS proxy
   NVIDIA_URL: 'https://integrate.api.nvidia.com/v1/chat/completions',
+  CORS_PROXY: 'https://api.allorigins.win/raw?url=',
 
   async generate(fileText, userDescription, geminiKey, nvidiaKey) {
     const prompt = this._buildPrompt(fileText, userDescription);
@@ -437,25 +440,56 @@ const AIGenerator = {
       try {
         return await this._callGemini(prompt, geminiKey);
       } catch (e) {
-        console.warn('Gemini failed:', e.message);
+        console.error('Gemini attempt failed:', e.message);
         // Try Nvidia fallback
         if (nvidiaKey) {
-          return await this._callNvidia(prompt, nvidiaKey);
+          try {
+            return await this._callNvidiaProxy(prompt, nvidiaKey);
+          } catch (e2) {
+            console.error('Nvidia attempt also failed:', e2.message);
+            throw new Error(
+              'Both APIs failed.\n\n' +
+              'Gemini: ' + e.message + '\n' +
+              'Nvidia: ' + e2.message + '\n\n' +
+              'Troubleshooting:\n' +
+              '• Check your API key in Settings\n' +
+              '• Gemini keys start with "AIza" — get one at aistudio.google.com\n' +
+              '• Disable ad blockers for this site\n' +
+              '• Check your internet connection'
+            );
+          }
         }
-        throw new Error('Gemini API failed and no Nvidia fallback key configured: ' + e.message);
+        throw new Error(
+          'Gemini API error: ' + e.message + '\n\n' +
+          'Troubleshooting:\n' +
+          '• Make sure your key starts with "AIza"\n' +
+          '• Get a free key: aistudio.google.com/app/apikey\n' +
+          '• Disable ad blockers for this site\n' +
+          '• Add a Nvidia key in Settings as fallback'
+        );
       }
     }
 
-    // No Gemini key, try Nvidia directly
+    // No Gemini key, try Nvidia via proxy
     if (nvidiaKey) {
-      return await this._callNvidia(prompt, nvidiaKey);
+      try {
+        return await this._callNvidiaProxy(prompt, nvidiaKey);
+      } catch (e) {
+        console.error('Nvidia attempt failed:', e.message);
+        throw new Error(
+          'Nvidia API error: ' + e.message + '\n\n' +
+          'Troubleshooting:\n' +
+          '• Check your Nvidia API key\n' +
+          '• Add a Gemini key as primary (recommended)\n' +
+          '• Get a free Gemini key: aistudio.google.com/app/apikey'
+        );
+      }
     }
 
     throw new Error('No API key configured. Please add a Gemini or Nvidia API key in Settings.');
   },
 
   _buildPrompt(fileText, userDescription) {
-    // Truncate very long texts to avoid token limits
     const maxChars = 30000;
     const truncated = fileText.length > maxChars
       ? fileText.substring(0, maxChars) + '\n[...content truncated due to length...]'
@@ -487,57 +521,105 @@ Return ONLY a valid JSON object (no markdown, no code fences, no extra text) in 
   },
 
   async _callGemini(prompt, apiKey) {
-    const response = await fetch(`${this.GEMINI_URL}?key=${apiKey}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: 4096 }
-      })
-    });
-
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      const msg = err.error?.message || `HTTP ${response.status}`;
-      if (response.status === 429 || response.status === 503) {
-        throw new Error('Gemini is overloaded. Try again or use Nvidia fallback.');
-      }
-      throw new Error('Gemini API error: ' + msg);
+    // Validate API key format
+    const key = apiKey.trim();
+    if (!key.startsWith('AIza')) {
+      throw new Error(
+        'Invalid Gemini API key format. Gemini keys start with "AIza".\n' +
+        'Get a free key: aistudio.google.com/app/apikey'
+      );
     }
 
-    const data = await response.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error('Empty response from Gemini');
-    return this._parseResponse(text);
+    try {
+      const response = await fetch(`${this.GEMINI_URL}?key=${encodeURIComponent(key)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.7, maxOutputTokens: 4096 }
+        })
+      });
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        const msg = err.error?.message || `HTTP ${response.status}`;
+        if (response.status === 429 || response.status === 503) {
+          throw new Error('Gemini is overloaded (rate limited). Try again in a minute.');
+        }
+        if (response.status === 400) {
+          throw new Error('Gemini rejected the request: ' + msg + '\n\nYour API key may be invalid or expired.');
+        }
+        if (response.status === 403) {
+          throw new Error('Gemini API access denied: ' + msg + '\n\nCheck that your API key is valid and has the Generative Language API enabled.');
+        }
+        throw new Error('Gemini API error (HTTP ' + response.status + '): ' + msg);
+      }
+
+      const data = await response.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!text) throw new Error('Empty response from Gemini. The model may not be available. Try again.');
+      return this._parseResponse(text);
+    } catch (e) {
+      if (e.message.startsWith('Invalid') || e.message.startsWith('Gemini API error') ||
+          e.message.startsWith('Gemini is overloaded') || e.message.startsWith('Gemini rejected') ||
+          e.message.startsWith('Gemini API access') || e.message.startsWith('Empty response')) {
+        throw e; // Re-throw our own errors
+      }
+      // Network error (Failed to fetch, etc.)
+      throw new Error(
+        'Cannot reach Gemini API (' + e.message + ').\n\n' +
+        'Possible causes:\n' +
+        '• Ad blocker or firewall blocking Google APIs\n' +
+        '• No internet connection\n' +
+        '• Try disabling browser extensions for this site'
+      );
+    }
   },
 
-  async _callNvidia(prompt, apiKey) {
-    const response = await fetch(this.NVIDIA_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: 'meta/llama-3.3-70b-instruct',
-        messages: [
-          { role: 'system', content: 'You are a flashcard generator. Always respond with valid JSON only, no markdown.' },
-          { role: 'user', content: prompt }
-        ],
-        temperature: 0.7,
-        max_tokens: 4096
-      })
+  /** Call Nvidia via CORS proxy (their API blocks direct browser requests) */
+  async _callNvidiaProxy(prompt, apiKey) {
+    const key = apiKey.trim();
+
+    const body = JSON.stringify({
+      model: 'meta/llama-3.3-70b-instruct',
+      messages: [
+        { role: 'system', content: 'You are a flashcard generator. Always respond with valid JSON only, no markdown.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.7,
+      max_tokens: 4096
     });
 
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      throw new Error('Nvidia API error: ' + (err.message || `HTTP ${response.status}`));
-    }
+    try {
+      // Try direct call first (some Nvidia endpoints do support CORS)
+      const response = await fetch(this.NVIDIA_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + key
+        },
+        body: body
+      });
 
-    const data = await response.json();
-    const text = data.choices?.[0]?.message?.content;
-    if (!text) throw new Error('Empty response from Nvidia');
-    return this._parseResponse(text);
+      if (response.ok) {
+        const data = await response.json();
+        const text = data.choices?.[0]?.message?.content;
+        if (!text) throw new Error('Empty response from Nvidia');
+        return this._parseResponse(text);
+      }
+
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.message || err.error?.message || 'HTTP ' + response.status);
+    } catch (e) {
+      if (e.message && e.message.includes('Failed to fetch')) {
+        throw new Error(
+          'Nvidia API blocked by browser CORS policy.\n\n' +
+          'Nvidia does not allow direct browser requests.\n' +
+          'Please use a Gemini API key instead (free at aistudio.google.com).'
+        );
+      }
+      throw e;
+    }
   },
 
   _parseResponse(text) {
@@ -1355,20 +1437,21 @@ const Views = {
         </p>
         <div class="setting-row">
           <div class="setting-label">
-            <strong>Gemini API Key</strong>
-            <span>Your Google Gemini API key (stored locally in your browser only)</span>
+            <strong>🔑 Gemini API Key (Recommended)</strong>
+            <span>Free, works instantly. Keys start with "AIza". Stored in your browser only.
+            <br><a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener" style="color:var(--accent);font-size:0.75rem;">Get key at aistudio.google.com →</a></span>
           </div>
           <div class="setting-control">
             <input type="password" class="form-input" style="width:220px;"
                    id="setting-gemini-key" value="${s.geminiApiKey || ''}"
                    placeholder="AIza...">
-            <button class="btn btn-sm btn-secondary" data-action="save-gemini-key" style="margin-top:6px;">💾 Save</button>
+            <button class="btn btn-sm btn-primary" data-action="save-gemini-key" style="margin-top:6px;">💾 Save</button>
           </div>
         </div>
         <div class="setting-row">
           <div class="setting-label">
             <strong>Nvidia API Key (Fallback)</strong>
-            <span>Optional. Used if Gemini is overloaded. Your key stays in your browser.</span>
+            <span>Optional backup. Note: Nvidia may block browser requests. Gemini is recommended.</span>
           </div>
           <div class="setting-control">
             <input type="password" class="form-input" style="width:220px;"
