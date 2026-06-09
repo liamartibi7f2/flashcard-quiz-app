@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flashcard Quiz</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Navigation -->
+    <nav id="topnav">
+      <div class="nav-inner">
+        <a href="#decks" class="nav-brand" data-page="decks">📚 Flashcard Quiz</a>
+        <div class="nav-links">
+          <a href="#decks" class="nav-link" data-page="decks" data-nav>Decks</a>
+          <a href="#stats" class="nav-link" data-page="stats" data-nav>Stats</a>
+          <a href="#settings" class="nav-link" data-page="settings" data-nav>Settings</a>
+          <button class="theme-btn" id="theme-toggle" title="Toggle dark mode" data-action="toggle-theme">🌙</button>
+        </div>
+      </div>
+    </nav>
+
+    <!-- Main content -->
+    <main id="main-content">
+      <div class="loading">Loading...</div>
+    </main>
+  </div>
+
+  <!-- Modal overlay -->
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div class="modal" id="modal-content">
+      <div class="modal-header">
+        <h3 id="modal-title"></h3>
+        <button class="modal-close" data-action="modal-close">&times;</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Toast notification -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
