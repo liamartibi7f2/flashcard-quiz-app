@@ -1,4 +1,4 @@
-﻿/* ============================================================
+/* ============================================================
    Flashcard Quiz App — All JavaScript
    ============================================================ */
 
@@ -74,7 +74,19 @@ const Store = {
 
   init() {
     const existing = this.load();
-    if (existing) return existing;
+    if (existing) {
+      // Migrate: ensure new settings fields exist for existing users
+      if (!('geminiModel' in existing.settings)) {
+        existing.settings.geminiModel = 'gemini-2.5-flash';
+      }
+      if (!('nvidiaModel' in existing.settings)) {
+        existing.settings.nvidiaModel = 'meta/llama-3.3-70b-instruct';
+      }
+      if (!('geminiProxyUrl' in existing.settings)) {
+        existing.settings.geminiProxyUrl = '';
+      }
+      return existing;
+    }
     // Fresh start
     const defaultState = {
       version: APP_VERSION,
@@ -92,7 +104,10 @@ const Store = {
         newCardsPerDay: 20,
         reviewsPerDay: 100,
         geminiApiKey: '',
-        nvidiaApiKey: ''
+        geminiModel: 'gemini-2.5-flash',
+        nvidiaApiKey: '',
+        nvidiaModel: 'meta/llama-3.3-70b-instruct',
+        geminiProxyUrl: ''
       }
     };
     this.save(defaultState);
@@ -425,68 +440,153 @@ const FileProcessor = {
 
 /** Generate flashcards using Gemini API (with Nvidia fallback via CORS proxy) */
 const AIGenerator = {
-  // Gemini supports CORS from browsers when using API key in query string
-  GEMINI_URL: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
+  // Gemini base URL (model is inserted dynamically)
+  GEMINI_BASE_URL: 'https://generativelanguage.googleapis.com/v1beta/models/',
 
-  // Nvidia NIM does NOT support CORS from browsers — we use a public CORS proxy
+  // Nvidia NIM URL
   NVIDIA_URL: 'https://integrate.api.nvidia.com/v1/chat/completions',
-  CORS_PROXY: 'https://api.allorigins.win/raw?url=',
 
-  async generate(fileText, userDescription, geminiKey, nvidiaKey) {
-    const prompt = this._buildPrompt(fileText, userDescription);
+  // Local companion server. Run `node server.js` from this folder to avoid browser CORS blocks.
+  LOCAL_PROXY_URL: 'http://127.0.0.1:8787/api',
 
-    // Try Gemini first
-    if (geminiKey) {
-      try {
-        return await this._callGemini(prompt, geminiKey);
-      } catch (e) {
-        console.error('Gemini attempt failed:', e.message);
-        // Try Nvidia fallback
-        if (nvidiaKey) {
-          try {
-            return await this._callNvidiaProxy(prompt, nvidiaKey);
-          } catch (e2) {
-            console.error('Nvidia attempt also failed:', e2.message);
-            throw new Error(
-              'Both APIs failed.\n\n' +
-              'Gemini: ' + e.message + '\n' +
-              'Nvidia: ' + e2.message + '\n\n' +
-              'Troubleshooting:\n' +
-              '• Check your API key in Settings\n' +
-              '• Gemini keys start with "AIza" — get one at aistudio.google.com\n' +
-              '• Disable ad blockers for this site\n' +
-              '• Check your internet connection'
-            );
-          }
+  // Request timeout in ms. Gemini can take a while for large uploaded files.
+  TIMEOUT_MS: 90000,
+
+  /**
+   * Fetch with timeout using AbortController.
+   * Returns the Response or throws 'timeout' / network error.
+   */
+  async _fetchWithTimeout(url, options, timeoutMs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs || this.TIMEOUT_MS);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      return response;
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+
+  async _callLocalProxy(path, payload, apiName) {
+    let response;
+    try {
+      response = await this._fetchWithTimeout(this.LOCAL_PROXY_URL + path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }, this.TIMEOUT_MS);
+    } catch (_) {
+      return null;
+    }
+
+    let data = null;
+    const raw = await response.text().catch(() => '');
+    if (raw) {
+      try { data = JSON.parse(raw); } catch (_) { /* handled below */ }
+    }
+
+    if (!response.ok) {
+      const msg = data?.error?.message || data?.message || raw || 'HTTP ' + response.status;
+      throw new Error(apiName + ' local proxy error: ' + msg);
+    }
+
+    return data;
+  },
+
+  _buildGeminiPayload(prompt) {
+    return {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.3,
+        maxOutputTokens: 8192,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'OBJECT',
+          properties: {
+            deckName: { type: 'STRING' },
+            deckDescription: { type: 'STRING' },
+            cards: {
+              type: 'ARRAY',
+              items: {
+                type: 'OBJECT',
+                properties: {
+                  front: { type: 'STRING' },
+                  back: { type: 'STRING' }
+                },
+                required: ['front', 'back']
+              }
+            }
+          },
+          required: ['deckName', 'cards']
         }
-        throw new Error(
-          'Gemini API error: ' + e.message + '\n\n' +
-          'Troubleshooting:\n' +
-          '• Make sure your key starts with "AIza"\n' +
-          '• Get a free key: aistudio.google.com/app/apikey\n' +
-          '• Disable ad blockers for this site\n' +
-          '• Add a Nvidia key in Settings as fallback'
-        );
       }
+    };
+  },
+
+  async generate(fileText, userDescription, geminiKey, geminiModel, nvidiaKey, nvidiaModel, geminiProxyUrl) {
+    const prompt = this._buildPrompt(fileText, userDescription);
+    const errors = [];
+
+    // Build a list of promises to race — whichever API responds first wins
+    const attempts = [];
+
+    if (geminiKey && ApiKeys.isGeminiKey(geminiKey)) {
+      attempts.push(
+        this._callGemini(prompt, geminiKey, geminiModel, geminiProxyUrl)
+          .then(result => ({ source: 'Gemini', result }))
+          .catch(err => {
+            errors.push('Gemini: ' + err.message);
+            return null;
+          })
+      );
+    } else if (geminiKey) {
+      errors.push('Gemini: ' + ApiKeys.describeGeminiProblem(geminiKey));
     }
 
-    // No Gemini key, try Nvidia via proxy
-    if (nvidiaKey) {
-      try {
-        return await this._callNvidiaProxy(prompt, nvidiaKey);
-      } catch (e) {
-        console.error('Nvidia attempt failed:', e.message);
-        throw new Error(
-          'Nvidia API error: ' + e.message + '\n\n' +
-          'Troubleshooting:\n' +
-          '• Check your Nvidia API key\n' +
-          '• Add a Gemini key as primary (recommended)\n' +
-          '• Get a free Gemini key: aistudio.google.com/app/apikey'
-        );
-      }
+    if (nvidiaKey && ApiKeys.isNvidiaKey(nvidiaKey)) {
+      attempts.push(
+        this._callNvidia(prompt, nvidiaKey, nvidiaModel)
+          .then(result => ({ source: 'Nvidia', result }))
+          .catch(err => {
+            errors.push('Nvidia: ' + err.message);
+            return null;
+          })
+      );
+    } else if (nvidiaKey) {
+      errors.push('Nvidia: The saved Nvidia key does not look valid. Nvidia keys usually start with "nvapi-".');
     }
 
-    throw new Error('No API key configured. Please add a Gemini or Nvidia API key in Settings.');
+    if (attempts.length === 0) {
+      throw new Error((errors.length ? errors.join('\n') + '\n\n' : '') +
+        'Please paste a valid Gemini API key in Settings. Gemini keys from Google AI Studio start with "AIza".');
+    }
+
+    // Race all attempts — first successful one wins
+    // But we also want to collect all errors if all fail
+    const results = await Promise.all(attempts);
+    const winner = results.find(r => r !== null);
+
+    if (winner) {
+      console.log('AI generation succeeded via', winner.source);
+      return winner.result;
+    }
+
+    // All attempts failed
+    const modelInfo = [];
+    if (geminiKey) modelInfo.push('Gemini (' + (geminiModel || 'gemini-2.5-flash') + ')');
+    if (nvidiaKey) modelInfo.push('Nvidia (' + (nvidiaModel || 'meta/llama-3.3-70b-instruct') + ')');
+
+    throw new Error(
+      'All APIs failed.\n\n' +
+      errors.join('\n') + '\n\n' +
+      'Troubleshooting:\n' +
+      '• Verify your API key(s) in Settings\n' +
+      '• Gemini keys start with "AIza" — get one at aistudio.google.com\n' +
+      '• If Google services are blocked in your region, try a VPN\n' +
+      '• Try different model names in Settings\n' +
+      '• Check your internet connection\n' +
+      '• Set up a free Gemini proxy in Settings → Gemini Proxy URL to bypass regional blocks'
+    );
   },
 
   _buildPrompt(fileText, userDescription) {
@@ -520,7 +620,7 @@ Return ONLY a valid JSON object (no markdown, no code fences, no extra text) in 
 }`;
   },
 
-  async _callGemini(prompt, apiKey) {
+  async _callGemini(prompt, apiKey, model, proxyUrl) {
     // Validate API key format
     const key = apiKey.trim();
     if (!key.startsWith('AIza')) {
@@ -530,58 +630,139 @@ Return ONLY a valid JSON object (no markdown, no code fences, no extra text) in 
       );
     }
 
+    const modelName = (model || 'gemini-2.5-flash').trim();
+    const url = `${this.GEMINI_BASE_URL}${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(key)}`;
+    const body = JSON.stringify(this._buildGeminiPayload(prompt));
+
+    // If user configured a custom proxy URL, use it exclusively (skip direct/broken paths)
+    if (proxyUrl && proxyUrl.trim()) {
+      console.log('Using custom Gemini proxy:', proxyUrl);
+      try {
+        const response = await this._fetchWithTimeout(proxyUrl.trim(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: modelName, apiKey: key, prompt: prompt })
+        }, this.TIMEOUT_MS);
+
+        if (!response.ok) {
+          const errText = await response.text().catch(() => '');
+          throw new Error('Proxy returned HTTP ' + response.status + ': ' + (errText || 'Unknown error'));
+        }
+
+        const data = await response.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) {
+          throw new Error('Proxy returned unexpected response: ' + JSON.stringify(data).substring(0, 200));
+        }
+        return this._parseResponse(text);
+      } catch (e) {
+        if (e.name === 'AbortError') {
+          throw new Error('Proxy timeout: Your Google Apps Script did not respond in time. Check the URL and deployment.');
+        }
+        if (e.message && e.message.startsWith('Proxy returned')) {
+          throw e;
+        }
+        throw new Error('Proxy unreachable: ' + (e.message || 'Failed to fetch') +
+          '. Make sure you deployed the web app with "Anyone" access at script.google.com');
+      }
+    }
+
+    const localData = await this._callLocalProxy('/gemini', {
+      model: modelName,
+      apiKey: key,
+      prompt: prompt
+    }, 'Gemini');
+    if (localData) {
+      const text = localData.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!text) throw new Error('Gemini local proxy returned an empty response.');
+      return this._parseResponse(text);
+    }
+
+    // Try direct call first
     try {
-      const response = await fetch(`${this.GEMINI_URL}?key=${encodeURIComponent(key)}`, {
+      const response = await this._fetchWithTimeout(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 4096 }
-        })
-      });
+        body: body
+      }, this.TIMEOUT_MS);
 
       if (!response.ok) {
         const err = await response.json().catch(() => ({}));
-        const msg = err.error?.message || `HTTP ${response.status}`;
+        const msg = err.error?.message || 'HTTP ' + response.status;
         if (response.status === 429 || response.status === 503) {
-          throw new Error('Gemini is overloaded (rate limited). Try again in a minute.');
+          throw new Error('Gemini overloaded (rate limited). Try again later.');
         }
         if (response.status === 400) {
-          throw new Error('Gemini rejected the request: ' + msg + '\n\nYour API key may be invalid or expired.');
+          throw new Error('Bad request: ' + msg + '. The model "' + modelName + '" may be invalid or your key expired.');
         }
         if (response.status === 403) {
-          throw new Error('Gemini API access denied: ' + msg + '\n\nCheck that your API key is valid and has the Generative Language API enabled.');
+          throw new Error('Gemini access denied. Your API key may be invalid or restricted.');
         }
-        throw new Error('Gemini API error (HTTP ' + response.status + '): ' + msg);
+        if (response.status === 404) {
+          throw new Error('Model "' + modelName + '" not found. Try "gemini-2.5-flash" in Settings.');
+        }
+        throw new Error('Gemini HTTP ' + response.status + ': ' + msg);
       }
 
       const data = await response.json();
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!text) throw new Error('Empty response from Gemini. The model may not be available. Try again.');
+      if (!text) throw new Error('Gemini returned empty response. Try a different model.');
       return this._parseResponse(text);
     } catch (e) {
-      if (e.message.startsWith('Invalid') || e.message.startsWith('Gemini API error') ||
-          e.message.startsWith('Gemini is overloaded') || e.message.startsWith('Gemini rejected') ||
-          e.message.startsWith('Gemini API access') || e.message.startsWith('Empty response')) {
-        throw e; // Re-throw our own errors
+      // If it's a timeout, re-throw immediately
+      if (e.name === 'AbortError') {
+        throw new Error('Gemini request timed out after ' + (this.TIMEOUT_MS / 1000) + 's.');
       }
-      // Network error (Failed to fetch, etc.)
-      throw new Error(
-        'Cannot reach Gemini API (' + e.message + ').\n\n' +
-        'Possible causes:\n' +
-        '• Ad blocker or firewall blocking Google APIs\n' +
-        '• No internet connection\n' +
-        '• Try disabling browser extensions for this site'
-      );
+
+      // If it's a server error (got an HTTP response), re-throw - proxy won't help
+      if (e.message && (e.message.startsWith('Gemini') || e.message.startsWith('Bad request') || e.message.startsWith('Model "'))) {
+        throw e;
+      }
+
+      // Network/CORS error — try through CORS proxy (Gemini puts key in URL, so proxy works)
+      console.warn('Gemini direct call failed, trying via CORS proxy...');
+      try {
+        return await this._callGeminiViaProxy(url, body);
+      } catch (proxyErr) {
+        throw new Error('Gemini unreachable. Direct call failed (' + (e.message || 'network error') + ') and proxy also failed.');
+      }
     }
   },
 
-  /** Call Nvidia via CORS proxy (their API blocks direct browser requests) */
-  async _callNvidiaProxy(prompt, apiKey) {
+  /** Try Gemini through CORS proxies (key is in the URL, so no auth headers needed) */
+  async _callGeminiViaProxy(url, body) {
+    const proxies = [
+      'https://corsproxy.io/?',
+      'https://api.allorigins.win/raw?url='
+    ];
+
+    for (const proxy of proxies) {
+      try {
+        const response = await this._fetchWithTimeout(proxy + encodeURIComponent(url), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: body
+        }, 10000);
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (text) return this._parseResponse(text);
+        }
+      } catch (_) {
+        continue;
+      }
+    }
+    throw new Error('All Gemini proxies failed');
+  },
+
+  /** Call Nvidia NIM API with CORS proxy fallback */
+  async _callNvidia(prompt, apiKey, model) {
     const key = apiKey.trim();
+    const modelName = (model || 'meta/llama-3.3-70b-instruct').trim();
 
     const body = JSON.stringify({
-      model: 'meta/llama-3.3-70b-instruct',
+      model: modelName,
       messages: [
         { role: 'system', content: 'You are a flashcard generator. Always respond with valid JSON only, no markdown.' },
         { role: 'user', content: prompt }
@@ -590,77 +771,223 @@ Return ONLY a valid JSON object (no markdown, no code fences, no extra text) in 
       max_tokens: 4096
     });
 
+    const localData = await this._callLocalProxy('/nvidia', {
+      model: modelName,
+      apiKey: key,
+      prompt: prompt
+    }, 'Nvidia');
+    if (localData) {
+      const text = localData.choices?.[0]?.message?.content;
+      if (!text) throw new Error('Nvidia local proxy returned an empty response.');
+      return this._parseResponse(text);
+    }
+
+    // Try direct Nvidia call with timeout
     try {
-      // Try direct call first (some Nvidia endpoints do support CORS)
-      const response = await fetch(this.NVIDIA_URL, {
+      const response = await this._fetchWithTimeout(this.NVIDIA_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': 'Bearer ' + key
         },
         body: body
-      });
+      }, this.TIMEOUT_MS);
 
       if (response.ok) {
         const data = await response.json();
         const text = data.choices?.[0]?.message?.content;
-        if (!text) throw new Error('Empty response from Nvidia');
+        if (!text) throw new Error('Nvidia returned empty response');
         return this._parseResponse(text);
       }
 
       const err = await response.json().catch(() => ({}));
-      throw new Error(err.message || err.error?.message || 'HTTP ' + response.status);
-    } catch (e) {
-      if (e.message && e.message.includes('Failed to fetch')) {
-        throw new Error(
-          'Nvidia API blocked by browser CORS policy.\n\n' +
-          'Nvidia does not allow direct browser requests.\n' +
-          'Please use a Gemini API key instead (free at aistudio.google.com).'
-        );
+      const errMsg = err.message || err.error?.message || 'HTTP ' + response.status;
+
+      if (response.status === 401 || response.status === 403) {
+        throw new Error('Nvidia access denied. Check your API key in Settings.');
       }
-      throw e;
+      if (response.status === 404 || (errMsg && errMsg.toLowerCase().includes('model'))) {
+        throw new Error('Nvidia model "' + modelName + '" not found. Check the model name in Settings.');
+      }
+
+      throw new Error('Nvidia HTTP ' + response.status + ': ' + errMsg);
+    } catch (e) {
+      // Already a structured error — re-throw
+      if (e.message && (e.message.startsWith('Nvidia') || e.message.startsWith('Model "'))) {
+        throw e;
+      }
+
+      // Timeout
+      if (e.name === 'AbortError') {
+        throw new Error('Nvidia request timed out.');
+      }
+
+      // CORS/network error — try via CORS proxy
+      console.warn('Nvidia direct call blocked by CORS/network, trying proxy...');
+      return await this._callNvidiaViaProxy(prompt, key, modelName);
     }
   },
 
+  /** Fallback: call Nvidia through CORS proxies */
+  async _callNvidiaViaProxy(prompt, apiKey, modelName) {
+    const payload = JSON.stringify({
+      model: modelName,
+      messages: [
+        { role: 'system', content: 'You are a flashcard generator. Always respond with valid JSON only, no markdown.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.7,
+      max_tokens: 4096
+    });
+
+    // Try multiple proxy approaches
+    const proxyAttempts = [
+      // corsproxy.io — forwards POST requests
+      (async () => {
+        const r = await this._fetchWithTimeout('https://corsproxy.io/?' + encodeURIComponent(this.NVIDIA_URL), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + apiKey
+          },
+          body: payload
+        }, 10000);
+        if (!r.ok) throw new Error('proxy returned ' + r.status);
+        return r.json();
+      })(),
+      // allorigins.win
+      (async () => {
+        const r = await this._fetchWithTimeout('https://api.allorigins.win/raw?url=' + encodeURIComponent(this.NVIDIA_URL), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + apiKey
+          },
+          body: payload
+        }, 10000);
+        if (!r.ok) throw new Error('proxy returned ' + r.status);
+        return r.json();
+      })(),
+      // codex.judge0 proxy
+      (async () => {
+        const r = await this._fetchWithTimeout('https://proxy.cors.sh/' + this.NVIDIA_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + apiKey,
+            'x-cors-api-key': 'temp_9b78e4c6c0f3f4a5d8e7f6a5b4c3d2e1'
+          },
+          body: payload
+        }, 10000);
+        if (!r.ok) throw new Error('proxy returned ' + r.status);
+        return r.json();
+      })()
+    ];
+
+    for (const attempt of proxyAttempts) {
+      try {
+        const data = await attempt;
+        const text = data.choices?.[0]?.message?.content;
+        if (text) return this._parseResponse(text);
+      } catch (_) {
+        continue;
+      }
+    }
+
+    throw new Error('Nvidia blocked (CORS). All proxies also failed. Use Gemini instead (recommended).');
+  },
+
   _parseResponse(text) {
-    // Clean up the response - remove markdown code fences if present
-    let cleaned = text.trim();
-    // Remove markdown code fences
-    cleaned = cleaned.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?\s*```$/i, '');
-    // Find JSON object boundaries
-    const start = cleaned.indexOf('{');
-    const end = cleaned.lastIndexOf('}');
-    if (start === -1 || end === -1) {
-      throw new Error('AI response did not contain valid JSON. Please try again.');
-    }
-    cleaned = cleaned.substring(start, end + 1);
+    let data = this._parseJsonLike(text);
 
-    let data;
-    try {
-      data = JSON.parse(cleaned);
-    } catch (e) {
-      throw new Error('Failed to parse AI response. The AI may have returned malformed data. Please try again.');
+    if (Array.isArray(data)) {
+      data = { deckName: 'Generated Flashcards', deckDescription: '', cards: data };
     }
 
-    // Validate the response structure
-    if (!data.deckName || typeof data.deckName !== 'string') {
-      throw new Error('AI did not generate a valid deck name. Please try again.');
-    }
-    if (!Array.isArray(data.cards) || data.cards.length === 0) {
-      throw new Error('AI did not generate any flashcards. Please try with more detailed content.');
-    }
+    const rawCards = data.cards || data.flashcards || data.items || data.questions || [];
+    const validCards = Array.isArray(rawCards)
+      ? rawCards.map(c => ({
+          front: String(c.front || c.question || c.term || c.prompt || c.q || '').trim(),
+          back: String(c.back || c.answer || c.definition || c.explanation || c.a || '').trim()
+        })).filter(c => c.front && c.back)
+      : [];
 
-    // Validate each card
-    const validCards = data.cards.filter(c => c.front && c.back && typeof c.front === 'string' && typeof c.back === 'string');
     if (validCards.length === 0) {
-      throw new Error('AI generated cards with invalid format. Please try again.');
+      throw new Error('AI responded, but no usable flashcards were found. Please try a shorter file or clearer instructions.');
     }
+
+    const deckName = String(data.deckName || data.title || data.name || 'Generated Flashcards').trim();
+    const deckDescription = String(data.deckDescription || data.description || '').trim();
 
     return {
-      deckName: data.deckName.substring(0, 60),
-      deckDescription: (data.deckDescription || '').substring(0, 120),
+      deckName: deckName.substring(0, 60),
+      deckDescription: deckDescription.substring(0, 120),
       cards: validCards
     };
+  },
+
+  _parseJsonLike(text) {
+    let cleaned = String(text || '').trim();
+    cleaned = cleaned.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?\s*```$/i, '').trim();
+
+    const candidates = [];
+    candidates.push(cleaned);
+
+    const objectStart = cleaned.indexOf('{');
+    const objectEnd = cleaned.lastIndexOf('}');
+    if (objectStart !== -1 && objectEnd > objectStart) {
+      candidates.push(cleaned.substring(objectStart, objectEnd + 1));
+    }
+
+    const arrayStart = cleaned.indexOf('[');
+    const arrayEnd = cleaned.lastIndexOf(']');
+    if (arrayStart !== -1 && arrayEnd > arrayStart) {
+      candidates.push(cleaned.substring(arrayStart, arrayEnd + 1));
+    }
+
+    for (const candidate of candidates) {
+      const repaired = this._repairJson(candidate);
+      try {
+        return JSON.parse(repaired);
+      } catch (_) {
+        // Try the next candidate.
+      }
+    }
+
+    throw new Error('Failed to parse AI response. Gemini responded, but the cards were not valid JSON. Please try again.');
+  },
+
+  _repairJson(text) {
+    return String(text || '')
+      .replace(/^\uFEFF/, '')
+      .replace(/[“”]/g, '"')
+      .replace(/[‘’]/g, "'")
+      .replace(/,\s*([}\]])/g, '$1')
+      .replace(/[\u0000-\u001F]+/g, match => {
+        return /[\r\n\t]/.test(match) ? match : ' ';
+      });
+  }
+};
+
+const ApiKeys = {
+  isGeminiKey(value) {
+    return /^AIza[0-9A-Za-z_-]{20,}$/.test((value || '').trim());
+  },
+
+  isNvidiaKey(value) {
+    return /^nvapi-[0-9A-Za-z_-]{20,}$/.test((value || '').trim());
+  },
+
+  describeGeminiProblem(value) {
+    const key = (value || '').trim();
+    if (!key) return 'No Gemini API key saved.';
+    if (!key.startsWith('AIza')) {
+      return 'The saved Gemini key is not a Google AI Studio key. Gemini keys start with "AIza".';
+    }
+    if (!this.isGeminiKey(key)) {
+      return 'The saved Gemini key looks incomplete. Copy the full key from Google AI Studio.';
+    }
+    return '';
   }
 };
 
@@ -946,7 +1273,10 @@ const State = {
         newCardsPerDay: 20,
         reviewsPerDay: 100,
         geminiApiKey: '',
-        nvidiaApiKey: ''
+        geminiModel: 'gemini-2.5-flash',
+        nvidiaApiKey: '',
+        nvidiaModel: 'meta/llama-3.3-70b-instruct',
+        geminiProxyUrl: ''
       }
     };
     this._persist();
@@ -1450,6 +1780,41 @@ const Views = {
         </div>
         <div class="setting-row">
           <div class="setting-label">
+            <strong>🤖 Gemini Model</strong>
+            <span>Choose which Gemini model to use. Default: gemini-2.5-flash (fast & capable).
+            <br><span style="font-size:0.75rem;color:var(--text-muted);">Popular: gemini-2.5-flash, gemini-2.5-pro, gemini-2.0-flash, gemma-3-27b-it</span></span>
+          </div>
+          <div class="setting-control">
+            <input type="text" class="form-input" style="width:220px;"
+                   id="setting-gemini-model" value="${s.geminiModel || 'gemini-2.5-flash'}"
+                   placeholder="gemini-2.5-flash">
+            <button class="btn btn-sm btn-secondary" data-action="save-gemini-model" style="margin-top:6px;">💾 Save</button>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">
+            <strong>🔄 Gemini Proxy URL (Advanced)</strong>
+            <span>Bypass regional blocks. Set up a free Google Apps Script proxy.
+            <details style="margin-top:6px;font-size:0.75rem;color:var(--text-secondary);">
+              <summary style="cursor:pointer;color:var(--accent);">📖 How to set up the proxy (2 min) →</summary>
+              <ol style="margin:4px 0;padding-left:18px;line-height:1.5;">
+                <li>Go to <a href="https://script.google.com/" target="_blank" rel="noopener" style="color:var(--accent);">script.google.com</a> → "+ New project"</li>
+                <li>Delete default code, paste the code from <strong>gemini-proxy.gs</strong> <em>(in your app folder)</em></li>
+                <li>Click <strong>Deploy → New Deployment → Web app</strong> → "Anyone" → Deploy</li>
+                <li>Copy the Web App URL and paste it here ↓</li>
+              </ol>
+            </details></span>
+          </div>
+          <div class="setting-control">
+            <input type="text" class="form-input" style="width:320px;"
+                   id="setting-gemini-proxy" value="${s.geminiProxyUrl || ''}"
+                   placeholder="https://script.google.com/macros/s/...">
+            <button class="btn btn-sm btn-secondary" data-action="save-gemini-proxy" style="margin-top:6px;">💾 Save</button>
+            <button class="btn btn-sm" data-action="test-gemini-proxy" style="margin-top:6px;margin-left:4px;background:#f0ad4e;color:#fff;">🔍 Test Proxy</button>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">
             <strong>Nvidia API Key (Fallback)</strong>
             <span>Optional backup. Note: Nvidia may block browser requests. Gemini is recommended.</span>
           </div>
@@ -1458,6 +1823,19 @@ const Views = {
                    id="setting-nvidia-key" value="${s.nvidiaApiKey || ''}"
                    placeholder="nvapi-...">
             <button class="btn btn-sm btn-secondary" data-action="save-nvidia-key" style="margin-top:6px;">💾 Save</button>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">
+            <strong>🎯 Nvidia Model</strong>
+            <span>Choose any Nvidia NIM model you have access to.
+            <br><span style="font-size:0.75rem;color:var(--text-muted);">Popular: meta/llama-3.3-70b-instruct, meta/llama-3.1-8b-instruct, nvidia/llama-3.1-nemotron-70b-instruct, mistralai/mistral-large-2-instruct</span></span>
+          </div>
+          <div class="setting-control">
+            <input type="text" class="form-input" style="width:260px;"
+                   id="setting-nvidia-model" value="${s.nvidiaModel || 'meta/llama-3.3-70b-instruct'}"
+                   placeholder="meta/llama-3.3-70b-instruct">
+            <button class="btn btn-sm btn-secondary" data-action="save-nvidia-model" style="margin-top:6px;">💾 Save</button>
           </div>
         </div>
       </div>
@@ -1515,8 +1893,9 @@ const Views = {
 
   /** Render the AI generation modal content */
   renderAIGenerateModal(state) {
-    const hasGemini = !!(state.settings.geminiApiKey);
-    const hasNvidia = !!(state.settings.nvidiaApiKey);
+    const geminiKeyProblem = ApiKeys.describeGeminiProblem(state.settings.geminiApiKey);
+    const hasGemini = ApiKeys.isGeminiKey(state.settings.geminiApiKey);
+    const hasNvidia = ApiKeys.isNvidiaKey(state.settings.nvidiaApiKey);
     const hasAnyKey = hasGemini || hasNvidia;
     const statusCls = hasAnyKey ? 'status-ready' : 'status-missing';
 
@@ -1562,7 +1941,7 @@ const Views = {
               <span style="font-size:0.8rem;color:var(--text-secondary);display:block;">
                 ${hasAnyKey
                   ? '✅ API key configured — ready to generate!'
-                  : '⚠️ No API key found. <a href="#settings" style="color:var(--accent);">Add one in Settings →</a>'}
+                  : '⚠️ ' + Views._escape(geminiKeyProblem || 'No valid API key found.') + ' <a href="#settings" style="color:var(--accent);">Fix in Settings →</a>'}
               </span>
             </div>
           </div>
@@ -1572,7 +1951,7 @@ const Views = {
               🪄 Generate Flashcards
             </button>
             <p style="font-size:0.75rem;color:var(--text-muted);margin-top:8px;">
-              ${hasGemini ? 'Using Google Gemini' : hasNvidia ? 'Using Nvidia AI' : 'No API key — add one in Settings'}
+              ${hasGemini ? 'Using Google Gemini (' + (state.settings.geminiModel || 'gemini-2.5-flash') + ')' : hasNvidia ? 'Using Nvidia AI (' + (state.settings.nvidiaModel || 'meta/llama-3.3-70b-instruct') + ')' : 'No valid API key — open Settings'}
             </p>
           </div>
         </div>
@@ -1581,7 +1960,8 @@ const Views = {
         <div id="ai-loading" style="display:none;" class="ai-card ai-loading-card">
           <div class="ai-spinner"></div>
           <p>Generating your flashcards...</p>
-          <p style="font-size:0.8rem;color:var(--text-muted);">This may take 10–30 seconds</p>
+          <p style="font-size:0.8rem;color:var(--text-muted);">Calling AI APIs — please wait...</p>
+          <p style="font-size:0.75rem;color:var(--text-muted);margin-top:4px;">This may take up to 90 seconds for large files</p>
         </div>
 
         <!-- Error state -->
@@ -1753,6 +2133,10 @@ const Router = {
         // Settings
         case 'save-gemini-key': this._saveApiKey('geminiApiKey', 'setting-gemini-key'); break;
         case 'save-nvidia-key': this._saveApiKey('nvidiaApiKey', 'setting-nvidia-key'); break;
+        case 'save-gemini-model': this._saveSetting('geminiModel', 'setting-gemini-model'); break;
+        case 'save-nvidia-model': this._saveSetting('nvidiaModel', 'setting-nvidia-model'); break;
+        case 'save-gemini-proxy': this._saveProxyUrl(); break;
+        case 'test-gemini-proxy': this._testProxyUrl(); break;
 
         // Modal
         case 'modal-close': this._closeModal(); break;
@@ -2320,7 +2704,10 @@ const Router = {
     const description = document.getElementById('ai-description')?.value?.trim() || '';
     const state = State.getState();
     const geminiKey = state.settings.geminiApiKey || '';
+    const geminiModel = state.settings.geminiModel || 'gemini-2.5-flash';
     const nvidiaKey = state.settings.nvidiaApiKey || '';
+    const nvidiaModel = state.settings.nvidiaModel || 'meta/llama-3.3-70b-instruct';
+    const geminiProxyUrl = state.settings.geminiProxyUrl || '';
 
     // Show loading, hide other states
     const loadingEl = document.getElementById('ai-loading');
@@ -2331,7 +2718,7 @@ const Router = {
     if (resultsEl) resultsEl.style.display = 'none';
 
     try {
-      const result = await AIGenerator.generate(this._currentGenText, description, geminiKey, nvidiaKey);
+      const result = await AIGenerator.generate(this._currentGenText, description, geminiKey, geminiModel, nvidiaKey, nvidiaModel, geminiProxyUrl);
 
       // Hide loading
       if (loadingEl) loadingEl.style.display = 'none';
@@ -2406,9 +2793,112 @@ const Router = {
     const input = document.getElementById(inputId);
     if (!input) return;
     const value = input.value.trim();
+
+    if (settingKey === 'geminiApiKey') {
+      const problem = ApiKeys.describeGeminiProblem(value);
+      if (value && problem) {
+        this._showToast('⚠️ ' + problem);
+        return;
+      }
+    }
+
+    if (settingKey === 'nvidiaApiKey' && value && !ApiKeys.isNvidiaKey(value)) {
+      this._showToast('⚠️ This does not look like an Nvidia API key. Nvidia keys usually start with "nvapi-".');
+      return;
+    }
+
     State.updateSettings({ [settingKey]: value });
-    this._showToast('✅ API key saved! (stored in your browser only)');
+    this._showToast(value ? '✅ API key saved! (stored in your browser only)' : '✅ API key cleared.');
     this.navigate();
+  },
+
+  _saveSetting(settingKey, inputId) {
+    const input = document.getElementById(inputId);
+    if (!input) return;
+    const value = input.value.trim();
+    if (!value) {
+      this._showToast('⚠️ Please enter a value');
+      return;
+    }
+    State.updateSettings({ [settingKey]: value });
+    this._showToast('✅ Setting saved!');
+    this.navigate();
+  },
+
+  _saveProxyUrl() {
+    const input = document.getElementById('setting-gemini-proxy');
+    if (!input) return;
+    const value = input.value.trim();
+    State.updateSettings({ geminiProxyUrl: value });
+    this._showToast(value ? '✅ Proxy URL saved! AI calls will use your proxy.' : '✅ Proxy URL cleared. AI calls will try direct connection.');
+    this.navigate();
+  },
+
+  async _testProxyUrl() {
+    const input = document.getElementById('setting-gemini-proxy');
+    const url = (input ? input.value.trim() : '') || State.getState().settings.geminiProxyUrl || '';
+    if (!url) {
+      this._showToast('⚠️ Enter and save a proxy URL first, then test it.');
+      return;
+    }
+
+    this._showToast('🔍 Testing proxy connection...');
+    const state = State.getState();
+    const apiKey = state.settings.geminiApiKey || '';
+    if (!apiKey) {
+      this._showToast('⚠️ Save your Gemini API key first before testing the proxy.');
+      return;
+    }
+
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 90000);
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: state.settings.geminiModel || 'gemini-2.5-flash',
+          apiKey: apiKey,
+          prompt: 'Reply with exactly: {"status":"ok"}'
+        }),
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => 'Unknown error');
+        this._showToast('❌ Proxy error (HTTP ' + response.status + '): ' + text.substring(0, 150));
+        return;
+      }
+
+      const data = await response.json();
+      if (data.error) {
+        const msg = data.error.message || JSON.stringify(data.error);
+        if (msg.indexOf('API key') !== -1 || msg.indexOf('API_KEY_INVALID') !== -1) {
+          this._showToast('❌ Gemini API key is invalid. Get a new key at aistudio.google.com');
+        } else if (msg.indexOf('quota') !== -1 || msg.indexOf('RESOURCE_EXHAUSTED') !== -1) {
+          this._showToast('❌ API quota exceeded. Try again later or get a new key.');
+        } else {
+          this._showToast('❌ Proxy error: ' + msg.substring(0, 150));
+        }
+        return;
+      }
+
+      // Check if we got a valid Gemini response
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (text) {
+        this._showToast('✅ Proxy works! Gemini responded successfully. You can now generate flashcards.');
+      } else {
+        this._showToast('⚠️ Proxy connected but Gemini returned unexpected format. Check the model name in Settings.');
+      }
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        this._showToast('❌ Proxy test timed out after 90s. The script may not be deployed as a Web App with "Anyone" access.');
+      } else {
+        this._showToast('❌ Cannot reach proxy: ' + (e.message || 'Failed to fetch') +
+          '. Make sure the URL is correct and deployed as Web App → "Anyone".');
+      }
+    }
   }
 };
 
